@@ -1,0 +1,16 @@
+---
+- name: Generate JSON config file for network namespace
+  copy:
+    content: "{{ netin_iface | to_json }}"
+    dest: "{{ setup_netns_script_target_dir }}/etc/netin_iface_config.json"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Show generated JSON config file (for verification)
+  command: cat "{{ setup_netns_script_target_dir }}/etc/netin_iface_config.json"
+  register: cat_output
+
+- debug:
+    var: cat_output.stdout
+

@@ -1,0 +1,9 @@
+---
+- name: Create dispatcher scripts for each interface
+  include_tasks: create_single_dispatcher_script.yml
+  loop: "{{ network_interfaces }}"
+  loop_control:
+    loop_var: item
+  vars:
+    iface: "{{ item }}"
+

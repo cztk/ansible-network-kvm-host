@@ -1,0 +1,13 @@
+---
+- name: Reload systemd
+  command: systemctl daemon-reload
+
+- name: Restart systemd-networkd
+  systemd:
+    name: systemd-networkd.service
+    state: restarted
+
+- name: Restart networkd-dispatcher
+  systemd:
+    name: networkd-dispatcher.service
+    state: restarted

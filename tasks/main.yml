@@ -1,0 +1,8 @@
+---
+- import_tasks: configure_networkd.yml
+- import_tasks: create_netns_service.yml
+- import_tasks: configure_netns_service.yml
+  #- import_tasks: create_dispatcher_scripts.yml
+  #- import_tasks: configure_dispatcher.yml
+  #- import_tasks: create_sshd_service.yml
+

@@ -1,0 +1,58 @@
+---
+- name: Copy the netns service file from template
+  template:
+    src: netns.service.j2
+    dest: /etc/systemd/system/setup-netns.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify:
+    - Reload systemd
+
+- name: Enable netns service
+  systemd:
+    name: setup-netns
+    enabled: yes
+
+- name: Ensure the directory structure exists
+  file:
+    path: "{{ setup_netns_script_target_dir }}"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Ensure the directory structure exists
+  file:
+    path: "{{ setup_netns_script_target_dir }}/bin"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Ensure the directory structure exists
+  file:
+    path: "{{ setup_netns_script_target_dir }}/etc"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+
+
+- name: Deploy the script from the template
+  template:
+    src: network-up.sh.j2
+    dest: "{{ setup_netns_script_target_dir }}/bin/network-up.sh"
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Ensure the script is executable
+  file:
+    path: "{{ setup_netns_script_target_dir }}/bin/network-up.sh"
+    mode: '0755'
+    owner: root
+    group: root
+    state: file
+

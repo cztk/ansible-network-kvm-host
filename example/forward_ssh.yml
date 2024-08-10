@@ -1,0 +1,80 @@
+---
+- hosts: all
+  roles:
+    - role: kvm-host-setup
+      vars:
+        netin_iface:
+          namespaces:
+            - "net-root"
+          veth:
+            - name: "veth-host"
+              peername: "veth-host-peer"
+              peerspace: "net-root"
+              peeraddress: "192.168.0.1"
+              netmask: "30"
+              network: "192.168.0.0"
+
+          bridges:
+            - name: "rootbr0"
+              addresses:
+                - address: "192.168.0.2"
+                  netmask: "30"
+                  network: "192.168.0.0"
+              routes:
+                - to: "0.0.0.0/0"
+                  via: "192.168.0.1"
+                  table: "main"
+                  metric: "100"
+              rules:
+                - from: "192.168.0.2/32"
+                  table: "main"
+                  priority: "100"
+              slaves:
+                - name: "veth-host"
+          iptrules:
+            ipv4:
+              - type: "MASQUERADE"
+                source: "192.168.0.0/24"
+                outface: "enp1s0"
+                namespace: "net-root"
+              - type: "FORWARD"
+                protocol: "tcp"
+                source: "0.0.0.0/0"
+                destination: "192.168.0.2"
+                inface: "enp1s0"
+                outface: "veth-host-peer"
+                namespace: "net-root"
+                dport: "22"
+              - type: "DNAT"
+                protocol: "tcp"
+                source: "0.0.0.0/0"
+                destination: "192.168.0.2"
+                inface: "enp1s0"
+                dport: "22"
+                namespace: "net-root"
+
+          interfaces:
+            - name: "enp1s0"
+              namespace: "net-root"
+              addresses:
+                - address: "192.168.100.230"
+                  netmask: "24"
+              routes:
+                - to: "0.0.0.0/0"
+                  via: "192.168.100.1"
+                  table: "main"
+                  metric: "100"
+              rules:
+                - from: "192.168.100.0/24"
+                  table: "main"
+                  priority: "100"
+                          #                      bond_mode: "balance-rr"
+                          #                      bond_options: "miimon=100"
+                          #                      bond_slaves:
+                          #                        - eth0
+                          #                        - eth1
+              forward_ssh: 0
+              forward_ssh_port: 22
+              ns_ssh: 0
+              ns_ssh_port: 23
+

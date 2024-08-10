@@ -1,0 +1,559 @@
+#!/bin/bash
+
+CONFIG_FILE="{{ setup_netns_script_target_dir }}/etc/netin_iface_config.json"
+CONFIG=$(jq '.' $CONFIG_FILE)
+
+log() {
+    echo "$(date +"%Y-%m-%d %H:%M:%S") - $@"
+}
+
+error_exit() {
+    log "ERROR: $1"
+    exit 1
+}
+
+check_dependencies() {
+    for cmd in ip jq systemctl; do
+        if ! command -v $cmd &> /dev/null; then
+            error_exit "$cmd could not be found. Please install it."
+        fi
+    done
+}
+
+namespace_exists() {
+    ip netns list | grep -qw "${1}"
+}
+
+interface_exists() {
+    ip link show "$1" > /dev/null 2>&1
+}
+
+link_in_namespace() {
+    ip -n "$1" link show "$2" > /dev/null 2>&1
+}
+
+# Function to check if an interface exists in a given namespace or root namespace
+interface_exists_or_ns() {
+    local iface=$1
+    local ns=$2
+    if [ -n "$ns" ]; then
+        ip -n "$ns" link show "$iface" > /dev/null 2>&1
+    else
+        ip link show "$iface" > /dev/null 2>&1
+    fi
+}
+
+setup_namespace() {
+    local namespace_name="$1"
+    if ! namespace_exists "${namespace_name}"; then
+        log "Adding namespace ${namespace_name}..."
+        ip netns add "${namespace_name}" || error_exit "Failed to create namespace ${namespace_name}"
+    else
+        log "Namespace ${namespace_name} already exists. Skipping creation."
+    fi
+}
+
+setup_veth_pair() {
+    local veth_config="$1"
+
+    local host_veth=$(echo "$veth_config" | jq -r '.name')
+    local peer_veth=$(echo "$veth_config" | jq -r '.peername')
+    local host_namespace=$(echo "$veth_config" | jq -r '.namespace // empty')
+    local peer_namespace=$(echo "$veth_config" | jq -r '.peerspace // empty')
+    local address=$(echo "$veth_config" | jq -r '.address // empty')
+    local peeraddress=$(echo "$veth_config" | jq -r '.peeraddress // empty')
+    local netmask=$(echo "$veth_config" | jq -r '.netmask // empty')
+
+    local host_cmd_prefix="ip"
+    [ -n "$host_namespace" ] && host_cmd_prefix+=" -n ${host_namespace}"
+    local peer_cmd_prefix="ip"
+    [ -n "$peer_namespace" ] && peer_cmd_prefix+=" -n ${peer_namespace}"
+
+    # Check if the host veth interface already exists in the correct namespace
+    if interface_exists_or_ns "$host_veth" "$host_namespace"; then
+        log "Veth pair ${host_veth} already exists in namespace ${host_namespace:-root}. Skipping creation."
+    else
+        $host_cmd_prefix link add "${host_veth}" type veth peer name "${peer_veth}" || log "Failed to create veth pair ${host_veth}:${peer_veth} in namespace ${host_namespace:-root}"
+    fi
+
+    $host_cmd_prefix link set "${host_veth}" down
+    $host_cmd_prefix link set "${peer_veth}" down
+
+    # Move the peer veth to the specified peer namespace if required
+    if link_in_namespace "${peer_namespace}" "${peer_veth}"; then
+        log "Veth pair ${peer_veth} already exists in namespace ${peer_namespace:-root}. Not moving."
+    else
+      if [ -n "${peer_namespace}" ]; then
+        log "Moving ${peer_veth} to namespace ${peer_namespace}..."
+        $host_cmd_prefix link set "${peer_veth}" netns "${peer_namespace}" || log "Failed to move ${peer_veth} from namespace ${host_namespace:-root} to ${peer_namespace:-root}"
+      fi
+    fi
+    
+    if [ -n "$address" ]; then
+        $host_cmd_prefix addr add "${address}/${netmask}" dev "${host_veth}" || log "Failed to configure IP ${address}/${netmask} on ${host_veth} in namespace ${peer_namespace:-root}"
+    fi
+    if [ -n "$peeraddress" ]; then
+        $peer_cmd_prefix addr add "${peeraddress}/${netmask}" dev "${peer_veth}" || log "Failed to configure IP ${peeraddress}/${netmask} on ${peer_veth} in namespace ${peer_namespace:-root}"
+    fi
+    
+    $host_cmd_prefix link set "${host_veth}" up
+    $peer_cmd_prefix link set "${peer_veth}" up
+
+
+    # TODO Configure routes and rules associated with the veth pair
+    #configure_routes_and_rules "$veth_config" "${peer_namespace}"
+}
+
+
+
+
+setup_bridge() {
+    local bridge_config="$1"
+
+    local bridge_name=$(echo "$bridge_config" | jq -r '.name')
+    local bridge_address=$(echo "$bridge_config" | jq -r '.address // empty')
+    local bridge_netmask=$(echo "$bridge_config" | jq -r '.netmask // empty')
+    local namespace=$(echo "$bridge_config" | jq -r '.namespace // empty')
+
+#    cmd_prefix="ip"
+#    [ -n "$namespace" ] && cmd_prefix+=" -n ${namespace}"
+#
+#    if [ -n "$namespace" ] && link_in_namespace "$namespace" "$bridge_name"; then
+#        log "Bridge ${bridge_name} already exists in namespace ${namespace}. Skipping creation."
+#    elif [ -z "$namespace" ] && interface_exists "$bridge_name"; then
+#        log "Bridge ${bridge_name} already exists. Skipping creation."
+#    else
+#        log "Creating bridge ${bridge_name} in namespace ${namespace:-root}..."
+#        $cmd_prefix link add "$bridge_name" type bridge || log "Failed to create bridge ${bridge_name} in namespace ${namespace:-root}"
+#    fi
+
+
+    if [ -n "$namespace" ] && namespace_exists "$namespace"; then
+        if link_in_namespace "$namespace" "$bridge_name"; then
+            log "Bridge ${bridge_name} already exists in namespace ${namespace}. Skipping creation."
+        else
+            log "Creating bridge ${bridge_name} in namespace ${namespace}..."
+            ip -n "$namespace" link add "$bridge_name" type bridge || log "Failed to create bridge ${bridge_name} in namespace ${namespace}"
+        fi
+    else
+        if [ -z "$namespace" ]; then
+            if interface_exists "$bridge_name"; then
+                log "Bridge ${bridge_name} already exists. Skipping creation."
+            else
+                log "Creating bridge ${bridge_name}..."
+                ip link add "$bridge_name" type bridge || log "Failed to create bridge ${bridge_name}"
+            fi
+        else
+          log "Bridge ${bridge_name} could not be created. Namespace ${namespace} not found."
+        fi
+    fi
+    configure_interface $bridge_config
+    configure_routes_and_rules "$bridge_config" "$namespace"
+}
+
+setup_bridge_slaves() {
+    local bridge="$1"
+    local bridge_name=$(echo "$bridge" | jq -r '.name')
+    local slaves=$(echo "$bridge" | jq -c '.slaves')
+    local namespace=$(echo "$bridge" | jq -r '.namespace // empty')
+
+    if interface_exists "$bridge_name"; then
+      for slave in $(echo "$slaves" | jq -c '.[]'); do
+        local slave_name=$(echo "$slave" | jq -r '.name')
+        if interface_exists "$bridge_name"; then
+            # Add the slave interface to the bridge
+            if [ -n "$namespace" ]; then
+                # Only proceed if the slave interface exists in the same namespace as the bridge
+                if link_in_namespace "$namespace" "$slave_name"; then
+                    log "Adding ${slave_name} to bridge ${bridge_name} in namespace ${namespace}"
+                    ip -n "$namespace" link set "$slave_name" master "$bridge_name" || log "Failed to add ${slave_name} to bridge ${bridge_name} in namespace ${namespace}"
+                else
+                    log "Slave interface ${slave_name} does not exist in namespace ${namespace:-root}. Skipping."
+                fi
+            else
+                log "Adding ${slave_name} to bridge ${bridge_name}"
+                ip link set "${slave_name}" master "${bridge_name}" || log "Failed to add ${slave_name} to bridge ${bridge_name}"
+            fi
+        else
+            log "Interface ${slave_name} does not exist. Skipping adding to bridge."
+        fi
+      done
+    else
+      log "Bridge ${bridge_name} does not exist. Skipping adding slaves."
+    fi
+}
+
+setup_bond_device() {
+    local bond_config="$1"
+
+    local iface_name=$(echo "$bond_config" | jq -r '.name')
+    local namespace=$(echo "$bond_config" | jq -r '.namespace // empty')
+    local bond_mode=$(echo "$bond_config" | jq -r '.bond_mode')
+    local bond_options=$(echo "$bond_config" | jq -r '.bond_options // empty')
+    local bond_slaves=$(echo "$bond_config" | jq -r '.bond_slaves[]?')
+
+    if ! link_in_namespace "${namespace}" "${iface_name}"; then
+        log "Creating bond device ${iface_name} in namespace ${namespace}..."
+        ip -n "${namespace}" link add "${iface_name}" type bond || error_exit "Failed to create bond device ${iface_name} in namespace ${namespace}"
+        ip -n "${namespace}" link set "${iface_name}" down || error_exit "Failed to set bond device ${iface_name} down"
+        ip -n "${namespace}" link set "${iface_name}" type bond mode "${bond_mode}" ${bond_options} || error_exit "Failed to configure bond device ${iface_name}"
+
+        log "Adding slave interfaces to the bond ${iface_name}..."
+        for slave in ${bond_slaves}; do
+            if interface_exists "${slave}"; then
+                ip link set "${slave}" down
+                ip link set "${slave}" netns "${namespace}" || error_exit "Failed to move ${slave} to namespace ${namespace}"
+                ip -n "${namespace}" link set "${slave}" master "${iface_name}" || error_exit "Failed to add ${slave} to bond ${iface_name} in namespace ${namespace}"
+                ip -n "${namespace}" link set "${slave}" up || error_exit "Failed to bring up slave ${slave} in bond ${iface_name}"
+            else
+                log "Interface ${slave} does not exist. Skipping bond slave addition."
+            fi
+        done
+    else
+        log "Bond device ${iface_name} already exists in namespace ${namespace}. Skipping creation."
+    fi
+
+    configure_routes_and_rules "$bond_config" "$namespace"
+}
+
+configure_interface() {
+    local iface_config="$1"
+
+    local iface_name=$(echo "$iface_config" | jq -r '.name')
+    local namespace=$(echo "$iface_config" | jq -r '.namespace // empty')
+    local addresses=$(echo "$iface_config" | jq -c '.addresses[]?')
+
+    local cmd_prefix="ip"
+    [ -n "$namespace" ] && cmd_prefix+=" -n ${namespace}"
+        
+    for addr in $addresses; do
+        local address=$(echo "$addr" | jq -r '.address')
+        local netmask=$(echo "$addr" | jq -r '.netmask')
+        local full_addr="${address}/${netmask}"
+        if ! $cmd_prefix addr show dev "${iface_name}" | grep -qw "${full_addr}"; then
+            log "Assigning IP ${full_addr} to ${iface_name} in namespace ${namespace:-root}..."
+            $cmd_prefix addr add "${full_addr}" dev "${iface_name}" || log "Failed to assign IP ${full_addr} to ${iface_name} in namespace ${namespace:-root}"
+            $cmd_prefix link set "${iface_name}" up
+        else
+            log "IP ${full_addr} is already assigned to ${iface_name} in namespace ${namespace:-root}. Skipping."
+        fi
+    done    
+}
+
+configure_routes_and_rules() {
+    local rr_config="$1"
+    local namespace="$2"
+
+    local routes=$(echo "$rr_config" | jq -c '.routes[]?')
+    local name=$(echo "$rr_config" | jq -r '.name // empty')
+    local rules=$(echo "$rr_config" | jq -c '.rules[]?')
+    
+    if [ -z "$routes" ]; then
+        log "No routes configured $name. Skipping route configuration."
+    else
+        local cmd_prefix=("ip")
+        [ -n "$namespace" ] && cmd_prefix+=("-n" "$namespace")
+            
+        for route in $routes; do
+            local to=$(echo "$route" | jq -r '.to')
+            local via=$(echo "$route" | jq -r '.via')
+            local table=$(echo "$route" | jq -r '.table // empty')
+            local metric=$(echo "$route" | jq -r '.metric // empty')
+            
+            local route_cmd=("route")
+            route_cmd+=("add")
+            [ -n "$to" ] && route_cmd+=("${to}")
+            [ -n "$via" ] && route_cmd+=("via" "${via}")
+            [ -n "$table" ] && route_cmd+=("table" "${table}")
+            [ -n "$metric" ] && route_cmd+=("metric" "${metric}")
+
+            log "route show ${table:+table $table}"
+            # TODO fix branch condition to reflect sorrounding code changes ...            
+            if ! "${cmd_prefix[@]}" route show ${table:+table "$table"} | grep -qw "$to"; then
+                log "Adding route to $to via $via in namespace ${namespace:-root}${table:+, table $table}${metric:+, metric $metric}..."
+                log "${cmd_prefix[@]}" "${route_cmd[@]}"
+                "${cmd_prefix[@]}" "${route_cmd[@]}" || log "Failed to add route to $to via $via in namespace ${namespace:-root}"
+            else
+                log "Route to $to via $via already exists in namespace ${namespace:-root}. Skipping."
+            fi
+#            if ! $cmd_prefix route show ${table:+table "$table"} | grep -qw "${to}"; then
+#                log "Adding route to ${to} via ${via} in namespace ${namespace:-root}${table:+, table ${table}}${metric:+, metric ${metric}}..."
+#                log "${route_cmd[@]}"
+#                "${route_cmd[@]}" || log "Failed to add route to ${to} via ${via} in namespace ${namespace:-root}"
+#            else
+#                log "Route to ${to} via ${via} already exists in namespace ${namespace:-root}. Skipping."
+#            fi
+
+        done
+
+    fi
+
+    if [ -z "$rules" ]; then
+        log "No rules configured for $name. Skipping rule configuration."
+    else
+        cmd_prefix=("ip")
+        [ -n "$namespace" ] && cmd_prefix+=("-n" "$namespace")
+            
+        for rule in $rules; do
+            local from=$(echo "$rule" | jq -r '.from // empty')
+            local to=$(echo "$rule" | jq -r '.to // empty')
+            local table=$(echo "$rule" | jq -r '.table')
+            local priority=$(echo "$rule" | jq -r '.priority')
+
+            rule_cmd=("${cmd_prefix[@]}")
+            rule_cmd+=("rule" "add")
+            [ -n "$from" ] && rule_cmd+=("from" "${from}")
+            [ -n "$to" ] && rule_cmd+=("to" "${to}")
+            [ -n "$table" ] && rule_cmd+=("table" "${table}")
+            [ -n "$priority" ] && rule_cmd+=("priority" "${priority}")
+
+            if ! $cmd_prefix rule show | grep -qw "from ${from} to ${to} lookup ${table}"; then
+                log "Adding rule from ${from} to ${to} in namespace ${namespace:-root}, table ${table}, priority ${priority}..."
+                "${rule_cmd[@]}" || log "Failed to add rule from ${from} to ${to} in namespace ${namespace:-root}"
+            else
+                log "Rule from ${from} to ${to}, table ${table} already exists in namespace ${namespace:-root}. Skipping."
+            fi
+            unset rule_cmd
+
+        done
+        unset cmd_prefix
+    fi
+
+}
+
+apply_ipt_rule() {
+    local rule="$1"
+    local type=$(echo "$rule" | jq -r '.type')
+    local source=$(echo "$rule" | jq -r '.source // empty')
+    local destination=$(echo "$rule" | jq -r '.destination // empty')
+    local dport=$(echo "$rule" | jq -r '.dport // empty')
+    local sport=$(echo "$rule" | jq -r '.sport // empty')
+    local protocol=$(echo "$rule" | jq -r '.protocol // empty')
+    local limit=$(echo "$rule" | jq -r '.limit // empty')
+    local inface=$(echo "$rule" | jq -r '.inface // empty')
+    local outface=$(echo "$rule" | jq -r '.outface // empty')
+    local namespace=$(echo "$rule" | jq -r '.namespace // empty')
+    local ipt_command=""
+    
+    # Determine if the rule is for IPv4 or IPv6
+    if [[ "$source" == *:* ]] || [[ "$destination" == *:* ]]; then
+        ipt_command="ip6tables"
+    else
+        ipt_command="iptables"
+    fi
+
+    # Apply namespace if specified
+    if [ -n "$namespace" ]; then
+        ipt_command="ip netns exec $namespace $ipt_command"
+    fi
+
+    case "$type" in
+        "MASQUERADE")
+            echo "Applying MASQUERADE rule for source $source"
+            $ipt_command -t nat -I POSTROUTING -s "$source" -o "$outface" -j MASQUERADE
+            ;;
+
+        "FORWARD")
+            echo "Applying FORWARD rule from $source to $destination"
+            $ipt_command -I FORWARD -p "$protocol" -s "$source" -i "$inface" -d "$destination" -o "$outface" --dport "$dport" --syn -m conntrack --ctstate NEW -j ACCEPT
+            $ipt_command -I FORWARD -p "$protocol" -s "$source" -i "$inface" -d "$destination" -o "$outface" --dport "$dport" --syn -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            $ipt_command -I FORWARD -p "$protocol" -d "$source" -o "$inface" -s "$destination" -i "$outface" --sport "$dport" --syn -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            if [ -n "$namespace" ]; then
+                ip netns exec $namespace sysctl -w net.ipv4.conf.${inface}.forwarding=1
+                ip netns exec $namespace sysctl -w net.ipv4.conf.${outface}.forwarding=1
+              else
+                sysctl -w net.ipv4.conf.${inface}.forwarding=1
+                sysctl -w net.ipv4.conf.${outface}.forwarding=1
+            fi
+            ;;
+
+        "DNAT")
+            echo "Applying DNAT rule from $source to $destination with dport $dport"
+            $ipt_command -t nat -I PREROUTING -p "$protocol" -s "$source" -i "${inface}" --dport "$dport" -j DNAT --to-destination "$destination"
+            ;;
+
+        "SNAT")
+            echo "Applying SNAT rule for source $source"
+            $ipt_command -t nat -I POSTROUTING -s "$source" -j SNAT --to-source "$destination"
+            ;;
+
+        "ALLOW_PORT")
+            echo "Allowing $protocol traffic on port $dport"
+            if [ -n "$limit" ]; then
+                $ipt_command -I INPUT -p "$protocol" --dport "$dport" -m limit --limit "$limit" -j ACCEPT
+            else
+                $ipt_command -I INPUT -p "$protocol" --dport "$dport" -j ACCEPT
+            fi
+            ;;
+
+        "ALLOW_RELATED")
+            echo "Allowing related/established connections"
+            $ipt_command -I INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+            ;;
+
+        "DROP_UDP_PING")
+            echo "Dropping UDP ping requests"
+            $ipt_command -I INPUT -p udp --dport 7 -j DROP
+            $ipt_command -I INPUT -p udp --dport 9 -j DROP
+            ;;
+
+        "RATE_LIMIT")
+            echo "Applying rate limiting for $protocol on port $dport"
+            $ipt_command -I INPUT -p "$protocol" --dport "$dport" -m limit --limit "$limit" -j ACCEPT
+            $ipt_command -I INPUT -p "$protocol" --dport "$dport" -j DROP
+            ;;
+
+        *)
+            echo "Unknown rule type: $type"
+            ;;
+    esac
+}
+
+
+# TODO plugin renderer firewalld nft
+setup_firewall() {
+    # TODO namespace and name and loop
+#    local knocking_sequence=$(echo "$CONFIG" | jq -r '.knockseq.ipv4[] // empty')
+    
+#    if [ -n "$knocking_sequence" ]; then
+#        ports=$(echo "$knocking_sequence" | jq -c '.ports[]')
+#        final_port=$(echo "$knocking_sequence" | jq -r '.final_port')
+#        knock_delay=$(echo "$knocking_sequence" | jq -r '.knock_delay // 5')
+#        knock_name="KNOCK_SEQUENCE"
+
+#        # Clear recent entries for port knocking
+#        iptables -N KNOCKING
+#        iptables -A INPUT -p tcp -m multiport --dports "$ports" -m recent --name "$knock_name" --set -j DROP
+
+#        # Final port rule to open the service after correct knocking sequence
+#        iptables -A INPUT -p tcp --dport "$final_port" -m recent --name "$knock_name" --rcheck --seconds "$knock_delay" --hitcount "$(echo "$ports" | wc -w)" -j ACCEPT
+#    fi    
+    
+    local iptrules=$(echo "$CONFIG" | jq -c '.iptrules.ipv4[] // empty')
+    if [ -z "$iptrules" ]; then
+        log "No iptable rules configured for $name. Skipping iptables configuration."
+    else
+        for rule in $iptrules; do
+            apply_ipt_rule "$rule"
+        done
+    fi
+}
+
+bring_up_interfaces() {
+    local namespace="$1"
+    local cmd_prefix="ip"
+    [ -n "$namespace" ] && cmd_prefix+=" -n ${namespace}"
+
+    log "Bringing up all interfaces in namespace ${namespace:-root}..."
+    $cmd_prefix link set lo up || log "Failed to bring up loopback interface in namespace ${namespace:-root}"
+
+    local interfaces=$($cmd_prefix link show | grep -E '^[0-9]+:' | awk -F: '{print $2}' | tr -d ' ')
+    for iface in $interfaces; do
+        log "Bringing up interface ${iface} in namespace ${namespace:-root}..."
+        $cmd_prefix link set "${iface%@*}" up || log "Failed to bring up interface ${iface} in namespace ${namespace:-root}"
+    done
+
+}
+
+bring_down_interfaces() {
+    local namespace="$1"
+    if [ -z "$namespace" ]; then
+      log "Bringing down all interfaces..."
+      local interfaces=$(ip link show | grep -E '^[0-9]+:' | awk -F: '{print $2}' | tr -d ' ')
+      for iface in $interfaces; do
+        log "Bringing down interface ${iface}..."
+        ip link set "${iface}" down || log "Failed to bring up interface ${iface}"
+      done
+    fi
+}
+
+setup_sshd() {
+    local namespace="$1"
+    local sshd_enabled="$2"
+    local sshd_port="$3"
+
+    if [ "$sshd_enabled" -eq 1 ]; then
+        log "Setting up SSHD in namespace ${namespace} on port ${sshd_port}..."
+        ip netns exec "${namespace}" systemctl start sshd.service || error_exit "Failed to start SSHD in namespace ${namespace}"
+    else
+        log "SSHD is disabled for namespace ${namespace}. Skipping."
+    fi
+}
+
+main() {
+    log "check dependencies..."
+    check_dependencies
+
+    # Bring down interfaces
+    log "bring down interfaces..."
+    bring_down_interfaces
+
+    log "Setup Namespaces..."
+    for namespace in $(echo "$CONFIG" | jq -r '.namespaces[]'); do
+        setup_namespace "${namespace}"
+    done
+    
+    log "Configure Interfaces..."
+    interfaces=$(echo "$CONFIG" | jq -c '.interfaces[]')
+    for iface in $interfaces; do
+        local bond_mode=$(echo "$iface" | jq -r '.bond_mode // empty')
+        local namespace=$(echo "$iface" | jq -r '.namespace // empty')
+        local iface_name=$(echo "$iface" | jq -r '.name // empty')
+
+        if [ -n "$bond_mode" ]; then
+            setup_bond_device "$iface"
+        else
+            if [ -n "$namespace" ]; then
+                ip link set "${iface_name}" netns "${namespace}"
+            fi
+            configure_interface "$iface"
+            configure_routes_and_rules "$iface" "$namespace"
+        fi
+    done
+
+    log "Setup VETH Pairs..."
+    veth_pairs=$(echo "$CONFIG" | jq -c '.veth[]')
+    for veth in $veth_pairs; do
+        setup_veth_pair "$veth"
+    done
+
+    log "Setup Bridges and Add Slaves..."
+    bridges=$(echo "$CONFIG" | jq -c '.bridges[]')
+    for bridge in $bridges; do
+        setup_bridge "$bridge"
+#	bridge_name=$(echo "$bridge" | jq -c '.name')
+#        slaves=$(echo "$bridge" | jq -c '.slaves')
+#	namespace=$(echo "$bridge" | jq -c '.namespace // empty')
+        setup_bridge_slaves "$bridge"
+#	"${bridge_name}" "${slaves}" "${namespace}"
+    done
+
+    log "Firewall..."
+    setup_firewall
+    
+    
+        # Enable routing
+	log "enable routing..."
+#        if ! ip -n "$(echo "$iface" | jq -r '.namespace // empty')" route show | grep -q "default via"; then
+#            log "Enable routing in namespace $(echo "$iface" | jq -r '.namespace // empty')..."
+#            ip -n "$(echo "$iface" | jq -r '.namespace // empty')" route add default via "$(echo "$iface" | jq -r '.gateway')" || error_exit "Failed to add default route in namespace $(echo "$iface" | jq -r '.namespace // empty')"
+#        else
+#            log "Default route already exists in namespace $(echo "$iface" | jq -r '.namespace // empty'). Skipping."
+#        fi
+
+        # Setup SSHD
+#        sshd_enabled=$(echo "$iface" | jq -r '.ns_ssh')
+#        sshd_port=$(echo "$iface" | jq -r '.ns_ssh_port')
+#        setup_sshd "$(echo "$iface" | jq -r '.namespace // empty')" "$sshd_enabled" "$sshd_port"    
+    
+    # Bring up interfaces
+    log "bring up interfaces..."
+    bring_up_interfaces
+        
+    # Notify systemd that the setup is ready
+    log "Network setup complete. Notifying systemd..."
+    systemd-notify --ready || error_exit "Failed to notify systemd"
+}
+
+main "$@"
+

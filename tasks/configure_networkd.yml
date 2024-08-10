@@ -1,0 +1,19 @@
+---
+- name: Ensure networkd configuration directory exists
+  file:
+    path: /etc/systemd/network
+    state: directory
+
+
+- name: Deploy networkd configuration for interfaces and bond slaves
+  template:
+    src: networkd.j2
+    dest: "/etc/systemd/network/{{ item }}.network"
+  loop: >
+    {{
+      (netin_iface.interfaces | selectattr('bond_slaves', 'undefined') | map(attribute='name')) +
+      (netin_iface.interfaces | selectattr('bond_slaves', 'defined') | map(attribute='bond_slaves') | flatten)
+    }}
+  loop_control:
+    loop_var: item
+

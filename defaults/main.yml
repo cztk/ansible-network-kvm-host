@@ -1,0 +1,9 @@
+network_interfaces: []
+setup_netns_script_target_dir: "/opt/setup-netns"
+netin_iface.hostbridge.name: "rootbr0"
+netin_iface.hostbridge.ip: "192.168.0.2/30"
+netin_iface.hostbridge.ns_ip: "192.168.0.1/30"
+netin_iface.hostbridge.net: "192.168.0.0/30"
+netin_iface.veth.host.name: "veth0"
+netin_iface.veth.ns.name: "veth1"
+

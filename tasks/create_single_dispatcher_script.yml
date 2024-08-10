@@ -1,0 +1,25 @@
+---
+- name: Create pre-up script for interface
+  template:
+    src: pre-up-script.j2
+    dest: /etc/networkd-dispatcher/configuring.d/pre-up-{{ iface.name }}.sh
+    mode: '0755'
+  vars:
+    iface: "{{ iface }}"
+
+- name: Create post-up script for interface
+  template:
+    src: post-up-script.j2
+    dest: /etc/networkd-dispatcher/routable.d/post-up-{{ iface.name }}.sh
+    mode: '0755'
+  vars:
+    iface: "{{ iface }}"
+
+- name: Create down script for interface
+  template:
+    src: down-script.j2
+    dest: /etc/networkd-dispatcher/off.d/down-{{ iface.name }}.sh
+    mode: '0755'
+  vars:
+    iface: "{{ iface }}"
+

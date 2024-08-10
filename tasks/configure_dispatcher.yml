@@ -1,0 +1,11 @@
+---
+- name: Ensure networkd-dispatcher service is enabled and started
+  systemd:
+    name: networkd-dispatcher.service
+    enabled: yes
+
+- name: Ensure networkd-dispatcher configuring.d directory exists
+  file:
+    path: /etc/networkd-dispatcher/configuring.d
+    state: directory
+

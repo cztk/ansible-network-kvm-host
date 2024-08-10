@@ -1,0 +1,19 @@
+[Unit]
+#Description=Setup network namespaces before networkd
+#After=systemd-udev-settle.service
+#Before=systemd-networkd.service
+#Before=network-pre.target
+#Wants=network-pre.target
+#Wants=systemd-networkd.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=Notify
+ExecStart={{ setup_netns_script_target_dir }}/bin/network-up.sh
+#RemainAfterExit=yes
+
+[Install]
+#WantedBy=sysinit.target
+WantedBy=multi-user.target
+
